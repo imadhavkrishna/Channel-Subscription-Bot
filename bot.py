@@ -68,11 +68,31 @@ except ValueError as exc:
 # ============================================================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
+# MongoDB Atlas TLS connection.
+# Atlas uses TLS by default with mongodb+srv:// URIs.
+# Disabling only the OCSP endpoint check can fix TLS handshake failures
+# caused by OCSP/proxy/network inspection issues while keeping normal
+# certificate and hostname verification enabled.
 try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+    client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=30000,
+        connectTimeoutMS=30000,
+        socketTimeoutMS=30000,
+        tls=True,
+        tlsDisableOCSPEndpointCheck=True,
+        retryWrites=True,
+        appname="TargetBankTelegramBot",
+    )
     client.admin.command("ping")
+    logger.info("MongoDB Atlas connection successful.")
 except Exception as exc:
-    raise RuntimeError(f"MongoDB connection failed: {exc}") from exc
+    logger.exception("MongoDB connection failed.")
+    raise RuntimeError(
+        "MongoDB connection failed. Check MongoDB Atlas Network Access, "
+        "MONGO_URI, database credentials, and TLS settings. "
+        f"Original error: {exc}"
+    ) from exc
 
 db = client["sub_management"]
 channels_col = db["channels"]
@@ -151,7 +171,7 @@ def start_handler(message):
                     f"You are joining: *{ch_data.get('name', 'Channel')}*.\n\n"
                     f"Please select a subscription plan below:",
                     reply_markup=markup,
-                    parse_mode="Markdown"
+                    parse_mode=None
                 )
                 return
 
@@ -251,7 +271,7 @@ def get_plans(message):
             "`Min:Price, Min:Price`\n\n"
             "Example:\n"
             "`1440:99, 43200:199` (1 Day and 30 Days)",
-            parse_mode="Markdown"
+            parse_mode=None
         )
         bot.register_next_step_handler(
             msg, finalize_channel, ch_id, ch_name
@@ -339,7 +359,7 @@ def finalize_channel(message, ch_id, ch_name):
             f"💳 Plans:\n{plan_lines}\n\n"
             "🔗 *Invite Link:*\n"
             f"https://t.me/{bot_username}?start={ch_id}",
-            parse_mode="Markdown"
+            parse_mode=None
         )
 
     except ValueError as exc:
@@ -351,7 +371,7 @@ def finalize_channel(message, ch_id, ch_name):
             "`Minutes:Price, Minutes:Price`\n\n"
             "Example:\n"
             "`1440:99, 43200:199`",
-            parse_mode="Markdown"
+            parse_mode=None
         )
 
     except Exception as exc:
@@ -360,7 +380,7 @@ def finalize_channel(message, ch_id, ch_name):
             ADMIN_ID,
             "⚠️ *Bot/System Error*\n\n"
             f"{exc}",
-            parse_mode="Markdown"
+            parse_mode=None
         )
 
 
@@ -428,7 +448,7 @@ def user_pays(call):
                 "'I Have Paid'."
             ),
             reply_markup=markup,
-            parse_mode="Markdown"
+            parse_mode=None
         )
 
     except Exception as exc:
@@ -487,7 +507,7 @@ def admin_notify(call):
             f"Plan: {format_duration(mins)}\n"
             f"Price: ₹{price}",
             reply_markup=markup,
-            parse_mode="Markdown"
+            parse_mode=None
         )
 
         u_markup = InlineKeyboardMarkup()
@@ -568,7 +588,7 @@ def approve_now(call):
             f"Subscription: {format_duration(mins)}\n\n"
             f"Join Link: {link.invite_link}\n\n"
             f"⚠️ This link/access expires in {format_duration(mins)}.",
-            parse_mode="Markdown"
+            parse_mode=None
         )
 
         bot.answer_callback_query(call.id, "Approved.")
@@ -658,7 +678,7 @@ def manage_ch(call):
             "from this channel again.",
             call.message.chat.id,
             call.message.message_id,
-            parse_mode="Markdown"
+            parse_mode=None
         )
 
     except Exception as exc:

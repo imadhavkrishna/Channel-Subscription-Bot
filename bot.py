@@ -48,6 +48,18 @@ def start_handler(message):
                 markup = InlineKeyboardMarkup()
                 # Display Dynamic Plans
                 for p_time, p_price in ch_data['plans'].items():
+                    def format_duration(minutes):
+    minutes = int(minutes)
+
+    if minutes < 60:
+        return f"{minutes} Min"
+
+    if minutes < 1440:
+        hours = minutes // 60
+        return f"{hours} Hour" if hours == 1 else f"{hours} Hours"
+
+    days = minutes // 1440
+    return f"{days} Day" if days == 1 else f"{days} Days"
                     label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
                     markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
                 
@@ -106,17 +118,124 @@ def get_plans(message):
 
 def finalize_channel(message, ch_id, ch_name):
     try:
-        raw_plans = message.text.split(',')
+        # Check empty message
+        if not message.text:
+            bot.send_message(
+                ADMIN_ID,
+                "❌ Please send the plans as text.\n\n"
+                "Example:\n"
+                "1440:99, 43200:199",
+                parse_mode="Markdown"
+            )
+            return
+
+        text = message.text.strip()
+
+        # Split plans by comma
+        raw_plans = text.split(',')
+
         plans_dict = {}
-        for p in raw_plans:
-            t, pr = p.strip().split(':')
-            plans_dict[t] = pr
-        
-        channels_col.update_one({"channel_id": ch_id}, {"$set": {"name": ch_name, "plans": plans_dict, "admin_id": ADMIN_ID}}, upsert=True)
+
+        for plan in raw_plans:
+            plan = plan.strip()
+
+            # Check colon
+            if ':' not in plan:
+                raise ValueError(
+                    f"Invalid plan: {plan}\n"
+                    "Expected format: Minutes:Price"
+                )
+
+            # Split only once
+            parts = plan.split(':', 1)
+
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Invalid plan: {plan}"
+                )
+
+            minutes = parts[0].strip()
+            price = parts[1].strip()
+
+            # Must be numbers
+            if not minutes.isdigit():
+                raise ValueError(
+                    f"Minutes must be a number: {minutes}"
+                )
+
+            if not price.isdigit():
+                raise ValueError(
+                    f"Price must be a number: {price}"
+                )
+
+            minutes = int(minutes)
+            price = int(price)
+
+            # Basic validation
+            if minutes <= 0:
+                raise ValueError("Minutes must be greater than 0.")
+
+            if price <= 0:
+                raise ValueError("Price must be greater than 0.")
+
+            plans_dict[str(minutes)] = str(price)
+
+        # Make sure at least one plan exists
+        if not plans_dict:
+            raise ValueError("No valid plans found.")
+
+        # Save to MongoDB
+        channels_col.update_one(
+            {"channel_id": ch_id},
+            {
+                "$set": {
+                    "name": ch_name,
+                    "plans": plans_dict,
+                    "admin_id": ADMIN_ID
+                }
+            },
+            upsert=True
+        )
+
         bot_username = bot.get_me().username
-        bot.send_message(ADMIN_ID, f"✅ Setup Successful!\n\nInvite Link for users:\n`https://t.me/{bot_username}?start={ch_id}`", parse_mode="Markdown")
-    except:
-        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price, Min:Price`. Use /add to retry.")
+
+        bot.send_message(
+            ADMIN_ID,
+            f"✅ *Setup Successful!*\n\n"
+            f"📢 Channel: *{ch_name}*\n\n"
+            f"💳 Plans:\n"
+            + "\n".join(
+                [f"• {mins} Minutes → ₹{price}"
+                 for mins, price in plans_dict.items()]
+            )
+            + f"\n\n🔗 *Invite Link:*\n"
+            f"https://t.me/{bot_username}?start={ch_id}",
+            parse_mode="Markdown"
+        )
+
+    except ValueError as e:
+        bot.send_message(
+            ADMIN_ID,
+            f"❌ Invalid plan format.\n\n"
+            f"Reason: {str(e)}\n\n"
+            f"Please use:\n"
+            f"Minutes:Price, Minutes:Price\n\n"
+            f"Example:\n"
+            f"1440:99, 43200:199",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        # IMPORTANT: Don't hide actual errors
+        print(f"FINALIZE ERROR: {repr(e)}")
+
+        bot.send_message(
+            ADMIN_ID,
+            f"⚠️ *Bot/System Error*\n\n"
+            f"{str(e)}\n\n"
+            f"The format itself may be correct.",
+            parse_mode="Markdown"
+        )
 
 # --- USER: PAYMENT FLOW ---
 

@@ -459,7 +459,7 @@ def user_pays(call):
 
 
 # ============================================================
-# USER: PAYMENT NOTIFICATION
+# USER: PAYMENT NOTIFICATION / VERIFICATION DETAILS
 # ============================================================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("paid_"))
 def admin_notify(call):
@@ -468,21 +468,128 @@ def admin_notify(call):
         ch_id = int(ch_id_text)
         mins = int(mins_text)
 
-        user = call.from_user
+        ch_data = channels_col.find_one({"channel_id": ch_id})
+        if not ch_data:
+            bot.answer_callback_query(call.id, "Channel not found.", show_alert=True)
+            return
+
+        price = ch_data.get("plans", {}).get(str(mins))
+        if price is None:
+            bot.answer_callback_query(call.id, "Plan no longer exists.", show_alert=True)
+            return
+
+        bot.answer_callback_query(call.id, "Please enter your transaction ID.", show_alert=True)
+
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🧾 Payment verification required.\n\n"
+            f"Plan: {format_duration(mins)}\n"
+            f"Amount: ₹{price}\n\n"
+            "Step 1 of 2: Please send your UPI/payment Transaction ID (UTR).\n\n"
+            "Example: 412345678901"
+        )
+        bot.register_next_step_handler(msg, receive_transaction_id, ch_id, mins)
+
+    except Exception as exc:
+        logger.exception("PAYMENT NOTIFICATION ERROR")
+        bot.answer_callback_query(
+            call.id, "Could not start payment verification.", show_alert=True
+        )
+
+
+def receive_transaction_id(message, ch_id, mins):
+    """Collect transaction/UTR ID, then request the payment screenshot."""
+    try:
+        transaction_id = (message.text or "").strip()
+
+        if not transaction_id:
+            retry = bot.send_message(
+                message.chat.id,
+                "❌ Transaction ID is required. Please send your UPI/payment Transaction ID (UTR)."
+            )
+            bot.register_next_step_handler(retry, receive_transaction_id, ch_id, mins)
+            return
+
+        if len(transaction_id) < 4 or len(transaction_id) > 100:
+            retry = bot.send_message(
+                message.chat.id,
+                "❌ That transaction ID does not look valid. Please send the correct Transaction ID / UTR."
+            )
+            bot.register_next_step_handler(retry, receive_transaction_id, ch_id, mins)
+            return
+
+        msg = bot.send_message(
+            message.chat.id,
+            "📸 Step 2 of 2: Please upload the payment screenshot now.\n\n"
+            "Make sure the screenshot clearly shows the payment status, amount and transaction details."
+        )
+        bot.register_next_step_handler(
+            msg, receive_payment_screenshot, ch_id, mins, transaction_id
+        )
+
+    except Exception as exc:
+        logger.exception("TRANSACTION ID ERROR")
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Could not process the transaction ID. Please try again."
+        )
+
+
+def receive_payment_screenshot(message, ch_id, mins, transaction_id):
+    """Receive screenshot and send it to Admin together with transaction ID."""
+    try:
+        user = message.from_user
         ch_data = channels_col.find_one({"channel_id": ch_id})
 
         if not ch_data:
-            bot.answer_callback_query(
-                call.id, "Channel not found.", show_alert=True
+            bot.send_message(message.chat.id, "❌ Channel information could not be found. Please try again.")
+            return
+
+        price = ch_data.get("plans", {}).get(str(mins))
+        if price is None:
+            bot.send_message(message.chat.id, "❌ This subscription plan is no longer available.")
+            return
+
+        if message.content_type == "photo":
+            file_id = message.photo[-1].file_id
+            send_type = "photo"
+        elif message.content_type == "document":
+            mime = (message.document.mime_type or "").lower()
+            if not mime.startswith("image/"):
+                retry = bot.send_message(
+                    message.chat.id,
+                    "❌ Please upload the payment screenshot as a photo/image."
+                )
+                bot.register_next_step_handler(
+                    retry, receive_payment_screenshot, ch_id, mins, transaction_id
+                )
+                return
+            file_id = message.document.file_id
+            send_type = "document"
+        else:
+            retry = bot.send_message(
+                message.chat.id,
+                "❌ Payment screenshot is required. Please upload it as a photo/image."
+            )
+            bot.register_next_step_handler(
+                retry, receive_payment_screenshot, ch_id, mins, transaction_id
             )
             return
 
-        price = ch_data["plans"].get(str(mins))
-        if price is None:
-            bot.answer_callback_query(
-                call.id, "Plan no longer exists.", show_alert=True
-            )
-            return
+        # Save pending payment so the transaction details remain available
+        # even if the bot is restarted before Admin approves/rejects it.
+        users_col.update_one(
+            {"user_id": user.id, "channel_id": ch_id},
+            {"$set": {
+                "payment_status": "pending",
+                "transaction_id": transaction_id,
+                "payment_screenshot_file_id": file_id,
+                "payment_amount": str(price),
+                "payment_plan_minutes": mins,
+                "payment_submitted_at": datetime.now(timezone.utc).timestamp()
+            }},
+            upsert=True
+        )
 
         markup = InlineKeyboardMarkup()
         markup.add(
@@ -494,44 +601,55 @@ def admin_notify(call):
         markup.add(
             InlineKeyboardButton(
                 "❌ Reject",
-                callback_data=f"rej_{user.id}"
+                callback_data=f"rej_{user.id}_{ch_id}_{mins}"
             )
         )
 
-        bot.send_message(
-            ADMIN_ID,
-            "🔔 *Payment Verification Required!*\n\n"
-            f"User: {user.first_name}\n"
-            f"User ID: `{user.id}`\n"
-            f"Channel: {ch_data.get('name', 'Channel')}\n"
-            f"Plan: {format_duration(mins)}\n"
-            f"Price: ₹{price}",
-            reply_markup=markup,
-            parse_mode=None
+        admin_caption = (
+            "🔔 PAYMENT VERIFICATION REQUIRED\n\n"
+            f"👤 Name: {user.first_name or 'N/A'}\n"
+            f"🔹 Username: @{user.username if user.username else 'N/A'}\n"
+            f"🆔 User ID: {user.id}\n"
+            f"📢 Channel: {ch_data.get('name', 'Channel')}\n"
+            f"💳 Plan: {format_duration(mins)}\n"
+            f"💰 Amount: ₹{price}\n"
+            f"🧾 Transaction ID / UTR: {transaction_id}\n\n"
+            "Please verify the screenshot and transaction ID before approving."
         )
 
-        u_markup = InlineKeyboardMarkup()
-        u_markup.add(
-            InlineKeyboardButton(
-                "📞 Contact Admin",
-                url=contact_url()
+        if send_type == "photo":
+            bot.send_photo(
+                ADMIN_ID,
+                file_id,
+                caption=admin_caption,
+                reply_markup=markup
             )
+        else:
+            bot.send_document(
+                ADMIN_ID,
+                file_id,
+                caption=admin_caption,
+                reply_markup=markup
+            )
+
+        contact_markup = InlineKeyboardMarkup()
+        contact_markup.add(
+            InlineKeyboardButton("📞 Contact Admin", url=contact_url())
         )
 
-        bot.answer_callback_query(
-            call.id, "Payment request sent to Admin."
-        )
         bot.send_message(
-            call.message.chat.id,
-            "✅ Your payment request has been sent. "
-            "Please wait for Admin approval.",
-            reply_markup=u_markup
+            message.chat.id,
+            "✅ Payment details submitted successfully.\n\n"
+            "Your transaction ID and payment screenshot have been sent to Admin for verification.\n"
+            "Please wait for approval.",
+            reply_markup=contact_markup
         )
 
-    except Exception:
-        logger.exception("PAYMENT NOTIFICATION ERROR")
-        bot.answer_callback_query(
-            call.id, "Could not send the request.", show_alert=True
+    except Exception as exc:
+        logger.exception("SCREENSHOT RECEIVING ERROR")
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Could not process your payment screenshot. Please try again."
         )
 
 
@@ -576,7 +694,9 @@ def approve_now(call):
                 "$set": {
                     "user_id": u_id,
                     "channel_id": ch_id,
-                    "expiry": expiry_ts
+                    "expiry": expiry_ts,
+                    "payment_status": "approved",
+                    "approved_at": datetime.now(timezone.utc).timestamp()
                 }
             },
             upsert=True
@@ -619,8 +739,15 @@ def reject_payment(call):
         return
 
     try:
-        _, u_id_text = call.data.split("_", 1)
-        u_id = int(u_id_text)
+        parts = call.data.split("_")
+        u_id = int(parts[1])
+        ch_id = int(parts[2]) if len(parts) > 2 else None
+
+        if ch_id is not None:
+            users_col.update_one(
+                {"user_id": u_id, "channel_id": ch_id},
+                {"$set": {"payment_status": "rejected"}}
+            )
 
         bot.send_message(
             u_id,

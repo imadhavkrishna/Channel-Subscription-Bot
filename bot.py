@@ -257,41 +257,39 @@ def cb_add_new(call):
 
 
 def get_plans(message):
-    if not message.from_user or message.from_user.id != ADMIN_ID:
+    if message.from_user.id != ADMIN_ID:
         return
 
-    # Telegram's newer Bot API uses forward_origin; older messages/libraries
-    # may expose forward_from_chat. Support both formats.
+    # Telegram Bot API may expose forwarded channel details through either
+    # the legacy forward_from_chat field or the newer forward_origin field.
     forwarded_chat = getattr(message, "forward_from_chat", None)
-    if not forwarded_chat:
+    if forwarded_chat is None:
         forward_origin = getattr(message, "forward_origin", None)
-        if forward_origin and getattr(forward_origin, "type", None) == "channel":
+        origin_type = getattr(forward_origin, "type", None)
+        if origin_type == "channel":
             forwarded_chat = getattr(forward_origin, "chat", None)
 
-    if forwarded_chat:
+    if forwarded_chat is not None and getattr(forwarded_chat, "id", None) is not None:
         ch_id = forwarded_chat.id
         ch_name = getattr(forwarded_chat, "title", None) or "Unnamed Channel"
 
         msg = bot.send_message(
             ADMIN_ID,
-            f"Channel Detected: {ch_name}\n\n"
+            f"Channel Detected: *{ch_name}*\n\n"
             "Enter plans in format (Minutes:Price):\n"
-            "Min:Price, Min:Price\n\n"
-            "Example: 1440:99, 43200:199 (1 Day and 30 Days)"
+            "`Min:Price, Min:Price`\n\n"
+            "Example:\n"
+            "`1440:99, 43200:199` (1 Day and 30 Days)",
+            parse_mode=None
         )
-        bot.register_next_step_handler(msg, finalize_channel, ch_id, ch_name)
+        bot.register_next_step_handler(
+            msg, finalize_channel, ch_id, ch_name
+        )
     else:
         bot.send_message(
             ADMIN_ID,
-            "❌ I couldn't detect the channel from that message.\n\n"
-            "Please open the channel, tap and hold a normal channel post, "
-            "choose Forward, and send it directly to this bot chat. "
-            "Do not copy/paste the message or send a screenshot.\n\n"
-            "If forwarding is restricted, send the channel's @username or "
-            "numeric -100... channel ID instead."
+            "❌ Channel details nahi mile. Channel se message ko Telegram ke Forward option se forward karein (Copy/Paste nahi). Agar channel forwarding restricted hai, to channel ka numeric ID bhejne ka option use karna hoga. /add se dobara try karein."
         )
-        retry = bot.send_message(ADMIN_ID, "Forward the channel post here to continue.")
-        bot.register_next_step_handler(retry, get_plans)
 
 
 def finalize_channel(message, ch_id, ch_name):
@@ -699,6 +697,14 @@ def approve_now(call):
             expire_date=expiry_ts
         )
 
+        approved_at = datetime.now(timezone.utc)
+
+        # Fetch the pending payment record so the complete payment details
+        # can be preserved in the database and shown to Admin after approval.
+        payment_data = users_col.find_one(
+            {"user_id": u_id, "channel_id": ch_id}
+        ) or {}
+
         users_col.update_one(
             {"user_id": u_id, "channel_id": ch_id},
             {
@@ -707,28 +713,97 @@ def approve_now(call):
                     "channel_id": ch_id,
                     "expiry": expiry_ts,
                     "payment_status": "approved",
-                    "approved_at": datetime.now(timezone.utc).timestamp()
+                    "approved_at": approved_at.timestamp(),
+                    "approved_invite_link": link.invite_link
                 }
             },
             upsert=True
         )
 
+        # Send the approved subscription link to the subscriber.
         bot.send_message(
             u_id,
-            "🥳 *Payment Approved!*\n\n"
+            "🥳 Payment Approved!\n\n"
             f"Subscription: {format_duration(mins)}\n\n"
             f"Join Link: {link.invite_link}\n\n"
             f"⚠️ This link/access expires in {format_duration(mins)}.",
             parse_mode=None
         )
 
-        bot.answer_callback_query(call.id, "Approved.")
+        # IMPORTANT: call.message is normally a PHOTO/DOCUMENT message here.
+        # Therefore edit_message_text() causes Telegram error 400:
+        # 'there is no text in the message to edit'.
+        # We send a fresh permanent approval record to Admin instead.
+        user_info = bot.get_chat(u_id)
+        first_name = user_info.first_name or "N/A"
+        last_name = user_info.last_name or ""
+        full_name = f"{first_name} {last_name}".strip()
+        username = f"@{user_info.username}" if user_info.username else "N/A"
 
-        bot.edit_message_text(
-            f"✅ Approved user {u_id} for {format_duration(mins)}.",
-            call.message.chat.id,
-            call.message.message_id
+        submitted_ts = payment_data.get("payment_submitted_at")
+        submitted_text = (
+            datetime.fromtimestamp(submitted_ts, tz=timezone.utc).strftime("%d-%m-%Y %H:%M:%S UTC")
+            if submitted_ts else "N/A"
         )
+        approved_text = approved_at.strftime("%d-%m-%Y %H:%M:%S UTC")
+        expiry_text = expiry_datetime.strftime("%d-%m-%Y %H:%M:%S UTC")
+
+        approved_record = (
+            "✅ PAYMENT APPROVED — RECORD SAVED\n\n"
+            "👤 SUBSCRIBER DETAILS\n"
+            f"Name: {full_name}\n"
+            f"Username: {username}\n"
+            f"Telegram User ID: {u_id}\n\n"
+            "📢 SUBSCRIPTION DETAILS\n"
+            f"Channel: {ch_data.get('name', 'N/A')}\n"
+            f"Channel ID: {ch_id}\n"
+            f"Plan: {format_duration(mins)}\n"
+            f"Plan Duration: {mins} minutes\n"
+            f"Amount Paid: ₹{payment_data.get('payment_amount', ch_data.get('plans', {}).get(str(mins), 'N/A'))}\n\n"
+            "🧾 PAYMENT DETAILS\n"
+            f"Transaction ID / UTR: {payment_data.get('transaction_id', 'N/A')}\n"
+            f"Payment Submitted: {submitted_text}\n"
+            "Payment Screenshot: Stored in original verification message\n\n"
+            "⏱ APPROVAL DETAILS\n"
+            f"Approved At: {approved_text}\n"
+            f"Access Expires: {expiry_text}\n\n"
+            "🔗 INVITE LINK\n"
+            f"{link.invite_link}\n\n"
+            "ℹ️ Payment screenshot is intentionally not repeated in this record."
+        )
+
+        bot.send_message(
+            ADMIN_ID,
+            approved_record,
+            parse_mode=None
+        )
+
+        bot.answer_callback_query(call.id, "Approved successfully.")
+
+        # The original verification message is a photo/document, so update
+        # its caption (not its text) to show that it has been processed.
+        try:
+            processed_caption = (
+                "✅ PAYMENT APPROVED\n\n"
+                f"Subscriber: {full_name} ({username})\n"
+                f"User ID: {u_id}\n"
+                f"Channel: {ch_data.get('name', 'N/A')}\n"
+                f"Plan: {format_duration(mins)}\n"
+                f"Amount: ₹{payment_data.get('payment_amount', 'N/A')}\n"
+                f"Transaction ID / UTR: {payment_data.get('transaction_id', 'N/A')}\n\n"
+                f"Approved: {approved_text}\n"
+                f"Expires: {expiry_text}"
+            )
+            bot.edit_message_caption(
+                processed_caption,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None
+            )
+        except Exception:
+            # Do not fail an otherwise successful approval just because the
+            # original media caption cannot be edited.
+            logger.exception("Could not update verification message caption")
 
     except Exception as exc:
         logger.exception("APPROVAL ERROR")

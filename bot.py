@@ -257,30 +257,41 @@ def cb_add_new(call):
 
 
 def get_plans(message):
-    if message.from_user.id != ADMIN_ID:
+    if not message.from_user or message.from_user.id != ADMIN_ID:
         return
 
-    if getattr(message, "forward_from_chat", None):
-        ch_id = message.forward_from_chat.id
-        ch_name = message.forward_from_chat.title or "Unnamed Channel"
+    # Telegram's newer Bot API uses forward_origin; older messages/libraries
+    # may expose forward_from_chat. Support both formats.
+    forwarded_chat = getattr(message, "forward_from_chat", None)
+    if not forwarded_chat:
+        forward_origin = getattr(message, "forward_origin", None)
+        if forward_origin and getattr(forward_origin, "type", None) == "channel":
+            forwarded_chat = getattr(forward_origin, "chat", None)
+
+    if forwarded_chat:
+        ch_id = forwarded_chat.id
+        ch_name = getattr(forwarded_chat, "title", None) or "Unnamed Channel"
 
         msg = bot.send_message(
             ADMIN_ID,
-            f"Channel Detected: *{ch_name}*\n\n"
+            f"Channel Detected: {ch_name}\n\n"
             "Enter plans in format (Minutes:Price):\n"
-            "`Min:Price, Min:Price`\n\n"
-            "Example:\n"
-            "`1440:99, 43200:199` (1 Day and 30 Days)",
-            parse_mode=None
+            "Min:Price, Min:Price\n\n"
+            "Example: 1440:99, 43200:199 (1 Day and 30 Days)"
         )
-        bot.register_next_step_handler(
-            msg, finalize_channel, ch_id, ch_name
-        )
+        bot.register_next_step_handler(msg, finalize_channel, ch_id, ch_name)
     else:
         bot.send_message(
             ADMIN_ID,
-            "❌ Error: Message was not forwarded. Use /add to try again."
+            "❌ I couldn't detect the channel from that message.\n\n"
+            "Please open the channel, tap and hold a normal channel post, "
+            "choose Forward, and send it directly to this bot chat. "
+            "Do not copy/paste the message or send a screenshot.\n\n"
+            "If forwarding is restricted, send the channel's @username or "
+            "numeric -100... channel ID instead."
         )
+        retry = bot.send_message(ADMIN_ID, "Forward the channel post here to continue.")
+        bot.register_next_step_handler(retry, get_plans)
 
 
 def finalize_channel(message, ch_id, ch_name):
